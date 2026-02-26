@@ -45,6 +45,7 @@ const (
 	colEventBuffer       = "event_buffer"
 	colLIDMappings       = "lid_mappings"
 	colOutgoingEvents    = "outgoing_events"
+	colMessageEvents     = "message_events"
 )
 
 // ---------------------------------------------------------------------------
@@ -308,6 +309,9 @@ func (c *MongoContainer) createIndexes() error {
 		{colLIDMappings, bson.D{{Key: "pn_user", Value: 1}}, "pn_user_1"},
 		{colOutgoingEvents, bson.D{{Key: "chat_jid", Value: 1}, {Key: "message_id", Value: 1}}, "chat_msg_1"},
 		{colOutgoingEvents, bson.D{{Key: "timestamp", Value: 1}}, "timestamp_1"},
+		{colMessageEvents, bson.D{{Key: "chat_jid", Value: 1}, {Key: "message_id", Value: 1}}, "chat_msg_1"},
+		{colMessageEvents, bson.D{{Key: "timestamp_ms", Value: 1}}, "timestamp_ms_1"},
+		{colMessageEvents, bson.D{{Key: "message_id", Value: 1}}, "message_id_1"},
 	}
 
 	for _, s := range specs {
@@ -840,6 +844,265 @@ func (a *MongoStoreAdapter) GetManyLIDsForPNs(ctx context.Context, pns []types.J
 		}
 	}
 	return result, cur.Err()
+}
+
+func (a *MongoStoreAdapter) GetAllLIDMappings(ctx context.Context) ([]store.LIDMapping, error) {
+	dbctx, cancel := dbCtxFrom(ctx)
+	defer cancel()
+
+	cur, err := a.inner.db.Collection(colLIDMappings).Find(
+		dbctx,
+		bson.M{},
+		options.Find().SetSort(bson.D{{Key: "lid_user", Value: 1}}),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(dbctx)
+
+	mappings := make([]store.LIDMapping, 0)
+	for cur.Next(dbctx) {
+		var doc bson.M
+		if err = cur.Decode(&doc); err != nil {
+			return nil, err
+		}
+		pnUser := toString(doc["pn_user"])
+		lidUser := toString(doc["lid_user"])
+		if pnUser == "" || lidUser == "" {
+			continue
+		}
+		mappings = append(mappings, store.LIDMapping{
+			LID: types.NewJID(lidUser, types.HiddenUserServer),
+			PN:  types.NewJID(pnUser, types.DefaultUserServer),
+		})
+	}
+	return mappings, cur.Err()
+}
+
+func (a *MongoStoreAdapter) GetLIDMappingsCount(ctx context.Context) (uint64, error) {
+	dbctx, cancel := dbCtxFrom(ctx)
+	defer cancel()
+
+	count, err := a.inner.db.Collection(colLIDMappings).CountDocuments(dbctx, bson.M{})
+	if err != nil {
+		return 0, err
+	}
+	return uint64(count), nil
+}
+
+func (a *MongoStoreAdapter) GetRecentChatTimestamps(ctx context.Context) (map[string]int64, error) {
+	dbctx, cancel := dbCtxFrom(ctx)
+	defer cancel()
+
+	result := make(map[string]int64)
+
+	messagePipeline := mongo.Pipeline{
+		{{Key: "$group", Value: bson.M{
+			"_id":  "$chat_jid",
+			"last": bson.M{"$max": "$timestamp_ms"},
+		}}},
+	}
+
+	msgCur, err := a.inner.db.Collection(colMessageEvents).Aggregate(dbctx, messagePipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer msgCur.Close(dbctx)
+
+	for msgCur.Next(dbctx) {
+		var row bson.M
+		if err = msgCur.Decode(&row); err != nil {
+			return nil, err
+		}
+		jid := toString(row["_id"])
+		if jid == "" {
+			continue
+		}
+		result[jid] = toInt64(row["last"])
+	}
+	if err = msgCur.Err(); err != nil {
+		return nil, err
+	}
+
+	pipeline := mongo.Pipeline{
+		{{Key: "$group", Value: bson.M{
+			"_id":  "$chat_jid",
+			"last": bson.M{"$max": "$timestamp"},
+		}}},
+	}
+
+	cur, err := a.inner.db.Collection(colOutgoingEvents).Aggregate(dbctx, pipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(dbctx)
+
+	for cur.Next(dbctx) {
+		var row bson.M
+		if err = cur.Decode(&row); err != nil {
+			return nil, err
+		}
+		jid := toString(row["_id"])
+		if jid == "" {
+			continue
+		}
+		last := toInt64(row["last"])
+		if existing, ok := result[jid]; !ok || last > existing {
+			result[jid] = last
+		}
+	}
+	return result, cur.Err()
+}
+
+func (a *MongoStoreAdapter) PutMessageEvent(
+	ctx context.Context,
+	chatJID string,
+	messageID string,
+	timestampMS int64,
+	fromMe bool,
+	status uint32,
+	data string,
+) error {
+	if strings.TrimSpace(chatJID) == "" || strings.TrimSpace(messageID) == "" || strings.TrimSpace(data) == "" {
+		return nil
+	}
+	dbctx, cancel := dbCtxFrom(ctx)
+	defer cancel()
+
+	if timestampMS <= 0 {
+		timestampMS = time.Now().UnixMilli()
+	}
+
+	normalizedJID := chatJID
+	if parsed, err := types.ParseJID(chatJID); err == nil {
+		normalizedJID = parsed.ToNonAD().String()
+	}
+
+	_, err := a.inner.db.Collection(colMessageEvents).ReplaceOne(
+		dbctx,
+		bson.M{
+			"chat_jid":   normalizedJID,
+			"message_id": messageID,
+		},
+		bson.M{
+			"chat_jid":      normalizedJID,
+			"message_id":    messageID,
+			"timestamp_ms":  timestampMS,
+			"timestamp":     timestampMS / 1000,
+			"from_me":       fromMe,
+			"status":        uint32(status),
+			"data":          data,
+			"updated_at_ms": time.Now().UnixMilli(),
+		},
+		options.Replace().SetUpsert(true),
+	)
+	return err
+}
+
+func (a *MongoStoreAdapter) ListMessageEvents(
+	ctx context.Context,
+	chatJIDs []string,
+	timestampGteMS *int64,
+	timestampLteMS *int64,
+	fromMe *bool,
+	status *uint32,
+	sortField string,
+	sortDesc bool,
+	offset int,
+	limit int,
+) ([]string, error) {
+	dbctx, cancel := dbCtxFrom(ctx)
+	defer cancel()
+
+	filter := bson.M{}
+	if len(chatJIDs) > 0 {
+		normalized := make([]string, 0, len(chatJIDs))
+		for _, jid := range chatJIDs {
+			if parsed, err := types.ParseJID(jid); err == nil {
+				normalized = append(normalized, parsed.ToNonAD().String())
+			} else if strings.TrimSpace(jid) != "" {
+				normalized = append(normalized, jid)
+			}
+		}
+		if len(normalized) > 0 {
+			filter["chat_jid"] = bson.M{"$in": normalized}
+		}
+	}
+	if timestampGteMS != nil || timestampLteMS != nil {
+		cond := bson.M{}
+		if timestampGteMS != nil {
+			cond["$gte"] = *timestampGteMS
+		}
+		if timestampLteMS != nil {
+			cond["$lte"] = *timestampLteMS
+		}
+		filter["timestamp_ms"] = cond
+	}
+	if fromMe != nil {
+		filter["from_me"] = *fromMe
+	}
+	if status != nil {
+		filter["status"] = uint32(*status)
+	}
+
+	sortKey := "timestamp_ms"
+	if strings.EqualFold(sortField, "id") {
+		sortKey = "message_id"
+	}
+	sortValue := 1
+	if sortDesc {
+		sortValue = -1
+	}
+
+	findOptions := options.Find().SetSort(bson.D{{Key: sortKey, Value: sortValue}})
+	if offset > 0 {
+		findOptions.SetSkip(int64(offset))
+	}
+	if limit > 0 {
+		findOptions.SetLimit(int64(limit))
+	}
+
+	cur, err := a.inner.db.Collection(colMessageEvents).Find(dbctx, filter, findOptions)
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(dbctx)
+
+	results := make([]string, 0)
+	for cur.Next(dbctx) {
+		var row bson.M
+		if err = cur.Decode(&row); err != nil {
+			return nil, err
+		}
+		data := toString(row["data"])
+		if strings.TrimSpace(data) == "" {
+			continue
+		}
+		results = append(results, data)
+	}
+	return results, cur.Err()
+}
+
+func (a *MongoStoreAdapter) GetMessageEventByID(ctx context.Context, messageID string) (string, error) {
+	if strings.TrimSpace(messageID) == "" {
+		return "", nil
+	}
+	dbctx, cancel := dbCtxFrom(ctx)
+	defer cancel()
+
+	var row bson.M
+	err := a.inner.db.Collection(colMessageEvents).FindOne(
+		dbctx,
+		bson.M{"message_id": messageID},
+		options.FindOne().SetSort(bson.D{{Key: "timestamp_ms", Value: -1}}),
+	).Decode(&row)
+	if errors.Is(err, mongo.ErrNoDocuments) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return toString(row["data"]), nil
 }
 
 // ---------------------------------------------------------------------------

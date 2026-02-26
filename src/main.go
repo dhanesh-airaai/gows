@@ -7,6 +7,7 @@ import (
 	"github.com/devlikeapro/gows/server"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/emptypb"
 	"net"
 	"os"
 )
@@ -27,9 +28,26 @@ func buildGrpcServer() *grpc.Server {
 	// 128 MB
 	maxMessageSize := 128 * 1024 * 1024
 
+	unknownMethodHandler := func(_ interface{}, stream grpc.ServerStream) error {
+		log := gowsLog.Stdout("gRPC", "INFO", false)
+		if method, ok := grpc.MethodFromServerStream(stream); ok {
+			log.Warnf("Handling unknown gRPC method with empty fallback response: %s", method)
+		} else {
+			log.Warnf("Handling unknown gRPC method with empty fallback response")
+		}
+
+		// Read and ignore one unary request payload, then return an empty response.
+		var req emptypb.Empty
+		if err := stream.RecvMsg(&req); err != nil {
+			return err
+		}
+		return stream.SendMsg(&emptypb.Empty{})
+	}
+
 	grpcServer := grpc.NewServer(
 		grpc.MaxRecvMsgSize(maxMessageSize),
 		grpc.MaxSendMsgSize(maxMessageSize),
+		grpc.UnknownServiceHandler(unknownMethodHandler),
 	)
 	srv := server.NewServer()
 	// Add an event handler to the client

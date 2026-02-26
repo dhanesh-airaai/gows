@@ -3,12 +3,16 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/devlikeapro/gows/media"
 	"github.com/devlikeapro/gows/proto"
 	"github.com/golang/protobuf/proto"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -24,6 +28,9 @@ func (s *Server) SendMessage(ctx context.Context, req *__.MessageRequest) (*__.M
 
 	message := waE2E.Message{}
 	mediaResponse := whatsmeow.UploadResponse{}
+	thumbnailTimeout := timeoutFromEnv("GOWS_THUMBNAIL_TIMEOUT", 8*time.Second)
+	uploadTimeout := timeoutFromEnv("GOWS_MEDIA_UPLOAD_TIMEOUT", 120*time.Second)
+	sendTimeout := timeoutFromEnv("GOWS_SEND_MESSAGE_TIMEOUT", 45*time.Second)
 
 	if req.Media == nil {
 		var backgroundArgb *uint32
@@ -45,18 +52,34 @@ func (s *Server) SendMessage(ctx context.Context, req *__.MessageRequest) (*__.M
 			Font:           font,
 		}
 	} else {
+		if len(req.Media.Content) == 0 {
+			return nil, errors.New("media content is empty")
+		}
+
+		uploadWithTimeout := func(mediaType whatsmeow.MediaType) (whatsmeow.UploadResponse, error) {
+			uploadCtx, cancel := withOperationTimeout(ctx, uploadTimeout)
+			defer cancel()
+			resp, uploadErr := cli.UploadMedia(uploadCtx, jid, req.Media.Content, mediaType)
+			if uploadErr != nil {
+				return whatsmeow.UploadResponse{}, fmt.Errorf("upload media (%v): %w", mediaType, uploadErr)
+			}
+			return resp, nil
+		}
+
 		var mediaType whatsmeow.MediaType
 		switch req.Media.Type {
 		case __.MediaType_IMAGE:
 			// Upload
 			mediaType = whatsmeow.MediaImage
-			mediaResponse, err = cli.UploadMedia(ctx, jid, req.Media.Content, mediaType)
+			mediaResponse, err = uploadWithTimeout(mediaType)
 			if err != nil {
 				return nil, err
 			}
 
 			// Generate Thumbnail
-			thumbnail, err := media.ImageThumbnail(req.Media.Content)
+			thumbnail, err := runBytesWithTimeout(thumbnailTimeout, func() ([]byte, error) {
+				return media.ImageThumbnail(req.Media.Content)
+			})
 			if err != nil {
 				s.log.Errorf("Failed to generate thumbnail: %v", err)
 			}
@@ -99,7 +122,7 @@ func (s *Server) SendMessage(ctx context.Context, req *__.MessageRequest) (*__.M
 			durationSeconds := uint32(duration)
 
 			// Upload
-			mediaResponse, err = cli.UploadMedia(ctx, jid, req.Media.Content, mediaType)
+			mediaResponse, err = uploadWithTimeout(mediaType)
 			if err != nil {
 				return nil, err
 			}
@@ -121,17 +144,19 @@ func (s *Server) SendMessage(ctx context.Context, req *__.MessageRequest) (*__.M
 		case __.MediaType_VIDEO:
 			mediaType = whatsmeow.MediaVideo
 			// Upload
-			mediaResponse, err = cli.UploadMedia(ctx, jid, req.Media.Content, mediaType)
+			mediaResponse, err = uploadWithTimeout(mediaType)
 			if err != nil {
 				return nil, err
 			}
 
 			// Generate Thumbnail
-			thumbnail, err := media.VideoThumbnail(
-				req.Media.Content,
-				0,
-				struct{ Width int }{Width: 72},
-			)
+			thumbnail, err := runBytesWithTimeout(thumbnailTimeout, func() ([]byte, error) {
+				return media.VideoThumbnail(
+					req.Media.Content,
+					0,
+					struct{ Width int }{Width: 72},
+				)
+			})
 
 			if err != nil {
 				s.log.Infof("Failed to generate video thumbnail: %v", err)
@@ -152,15 +177,21 @@ func (s *Server) SendMessage(ctx context.Context, req *__.MessageRequest) (*__.M
 		case __.MediaType_DOCUMENT:
 			mediaType = whatsmeow.MediaDocument
 			// Upload
-			mediaResponse, err = cli.UploadMedia(ctx, jid, req.Media.Content, mediaType)
+			mediaResponse, err = uploadWithTimeout(mediaType)
 			if err != nil {
 				return nil, err
 			}
 
-			// Generate Thumbnail if possible
-			thumbnail, err := media.ImageThumbnail(req.Media.Content)
-			if err != nil {
-				s.log.Infof("Failed to generate thumbnail: %v", err)
+			// Generate thumbnail only for image-like documents.
+			thumbnail := []byte(nil)
+			mimetype := strings.ToLower(req.Media.Mimetype)
+			if strings.HasPrefix(mimetype, "image/") {
+				thumbnail, err = runBytesWithTimeout(thumbnailTimeout, func() ([]byte, error) {
+					return media.ImageThumbnail(req.Media.Content)
+				})
+				if err != nil {
+					s.log.Infof("Failed to generate document thumbnail: %v", err)
+				}
 			}
 
 			// Attach
@@ -175,6 +206,8 @@ func (s *Server) SendMessage(ctx context.Context, req *__.MessageRequest) (*__.M
 				FileLength:    &mediaResponse.FileLength,
 				JPEGThumbnail: thumbnail,
 			}
+		default:
+			return nil, fmt.Errorf("unsupported media type: %v", req.Media.Type)
 		}
 	}
 
@@ -184,12 +217,55 @@ func (s *Server) SendMessage(ctx context.Context, req *__.MessageRequest) (*__.M
 		extra.MediaHandle = mediaResponse.Handle
 	}
 
-	res, err := cli.SendMessage(ctx, jid, &message, extra)
+	sendCtx, cancel := withOperationTimeout(ctx, sendTimeout)
+	defer cancel()
+	res, err := cli.SendMessage(sendCtx, jid, &message, extra)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("send message: %w", err)
 	}
 
 	return &__.MessageResponse{Id: res.ID, Timestamp: res.Timestamp.Unix()}, nil
+}
+
+func timeoutFromEnv(name string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	if value, err := time.ParseDuration(raw); err == nil && value > 0 {
+		return value
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return fallback
+}
+
+func withOperationTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if deadline, ok := parent.Deadline(); ok {
+		if time.Until(deadline) <= timeout {
+			return context.WithCancel(parent)
+		}
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func runBytesWithTimeout(timeout time.Duration, fn func() ([]byte, error)) ([]byte, error) {
+	type output struct {
+		data []byte
+		err  error
+	}
+	done := make(chan output, 1)
+	go func() {
+		data, err := fn()
+		done <- output{data: data, err: err}
+	}()
+	select {
+	case result := <-done:
+		return result.data, result.err
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("operation timed out after %s", timeout)
+	}
 }
 
 func (s *Server) SendReaction(ctx context.Context, req *__.MessageReaction) (*__.MessageResponse, error) {

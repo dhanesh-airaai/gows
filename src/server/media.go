@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"github.com/devlikeapro/gows/proto"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 )
@@ -19,7 +20,7 @@ func (s *Server) DownloadMedia(ctx context.Context, req *__.DownloadMediaRequest
 	resp, err := cli.DownloadAny(ctx, msg)
 	if err != nil {
 		s.log.Errorf("Failed to download media: %v", err)
-		return nil, nil
+		return nil, fmt.Errorf("download media: %w", err)
 	}
 	return &__.DownloadMediaResponse{Content: resp}, nil
 }
