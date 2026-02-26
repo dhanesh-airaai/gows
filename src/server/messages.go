@@ -237,7 +237,7 @@ func (s *Server) MarkRead(ctx context.Context, req *__.MarkReadRequest) (*__.Emp
 	// id to ids array
 	ids := []types.MessageID{req.MessageId}
 	now := time.Now()
-	err = cli.MarkRead(ids, now, jid, sender, receiptType)
+	err = cli.MarkRead(ctx, ids, now, jid, sender, receiptType)
 	if err != nil {
 		return nil, err
 	}

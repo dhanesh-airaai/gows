@@ -40,9 +40,9 @@ type SessionConfig struct {
 }
 
 func init() {
-	// Firefox (Ubuntu)
-	store.DeviceProps.PlatformType = proto.DeviceProps_FIREFOX.Enum()
-	store.SetOSInfo("Ubuntu", [3]uint32{22, 0, 4})
+	// Align device metadata with current web client expectations.
+	store.DeviceProps.PlatformType = proto.DeviceProps_CHROME.Enum()
+	store.SetOSInfo("Linux", [3]uint32{6, 8, 0})
 }
 
 func NewSessionManager() *SessionManager {

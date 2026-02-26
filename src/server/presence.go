@@ -23,7 +23,7 @@ func (s *Server) SendPresence(ctx context.Context, req *__.PresenceRequest) (*__
 		return nil, errors.New("invalid presence")
 	}
 
-	err = cli.SendPresence(presence)
+	err = cli.SendPresence(ctx, presence)
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +53,7 @@ func (s *Server) SendChatPresence(ctx context.Context, req *__.ChatPresenceReque
 	default:
 		return nil, errors.New("invalid chat presence")
 	}
-	err = cli.SendChatPresence(jid, presence, presenceMedia)
+	err = cli.SendChatPresence(ctx, jid, presence, presenceMedia)
 	if err != nil {
 		return nil, err
 	}
@@ -69,11 +69,11 @@ func (s *Server) SubscribePresence(ctx context.Context, req *__.SubscribePresenc
 	if err != nil {
 		return nil, err
 	}
-	err = cli.SendPresence(types.PresenceAvailable)
+	err = cli.SendPresence(ctx, types.PresenceAvailable)
 	if err != nil {
 		return nil, err
 	}
-	err = cli.SubscribePresence(jid)
+	err = cli.SubscribePresence(ctx, jid)
 	if err != nil {
 		return nil, err
 	}

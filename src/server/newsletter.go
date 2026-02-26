@@ -44,7 +44,7 @@ func (s *Server) GetSubscribedNewsletters(ctx context.Context, req *__.Newslette
 	if err != nil {
 		return nil, err
 	}
-	resp, err := cli.GetSubscribedNewsletters()
+	resp, err := cli.GetSubscribedNewsletters(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -74,13 +74,13 @@ func (s *Server) GetNewsletterInfo(ctx context.Context, req *__.NewsletterInfoRe
 		if err != nil {
 			return nil, err
 		}
-		resp, err := cli.GetNewsletterInfo(jid)
+		resp, err := cli.GetNewsletterInfo(ctx, jid)
 		if err != nil {
 			return nil, err
 		}
 		return toNewsletter(resp), nil
 	}
-	resp, err := cli.GetNewsletterInfoWithInvite(id)
+	resp, err := cli.GetNewsletterInfoWithInvite(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +97,7 @@ func (s *Server) CreateNewsletter(ctx context.Context, req *__.CreateNewsletterR
 		Description: req.GetDescription(),
 		Picture:     req.GetPicture(),
 	}
-	resp, err := cli.CreateNewsletter(params)
+	resp, err := cli.CreateNewsletter(ctx, params)
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +117,7 @@ func (s *Server) NewsletterToggleMute(ctx context.Context, req *__.NewsletterTog
 	if !gows.IsNewsletter(jid) {
 		return nil, errors.New("invalid jid, not a newsletter")
 	}
-	err = cli.NewsletterToggleMute(jid, req.GetMute())
+	err = cli.NewsletterToggleMute(ctx, jid, req.GetMute())
 	if err != nil {
 		return nil, err
 	}
@@ -138,9 +138,9 @@ func (s *Server) NewsletterToggleFollow(ctx context.Context, req *__.NewsletterT
 		return nil, errors.New("invalid jid, not a newsletter")
 	}
 	if req.Follow {
-		err = cli.FollowNewsletter(jid)
+		err = cli.FollowNewsletter(ctx, jid)
 	} else {
-		err = cli.UnfollowNewsletter(jid)
+		err = cli.UnfollowNewsletter(ctx, jid)
 	}
 	if err != nil {
 		return nil, err

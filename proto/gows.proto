@@ -18,13 +18,18 @@ message OptionalUInt32 {
 // Events
 //
 service EventStream {
-  rpc StreamEvents(Session) returns (stream EventJson);
+  rpc StreamEvents(StreamEventsRequest) returns (stream EventJson);
 }
 
 message EventJson {
   string session = 2;
   string event = 1;
   string data = 3;
+}
+
+message StreamEventsRequest {
+  Session session = 1;
+  repeated string exclude = 2;
 }
 
 service MessageService {
@@ -282,4 +287,3 @@ message DownloadMediaRequest {
 message DownloadMediaResponse {
   bytes content = 1;
 }
-

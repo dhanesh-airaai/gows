@@ -2,15 +2,30 @@ package gows
 
 import (
 	"context"
-	_ "github.com/lib/pq"           // Import the Postgres drive
-	_ "github.com/mattn/go-sqlite3" // Import the SQLite drive
+	"fmt"
+	"github.com/devlikeapro/gows/mongostore"
+	_ "github.com/lib/pq"           // PostgreSQL driver
+	_ "github.com/mattn/go-sqlite3" // SQLite driver
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
+	"io"
+	"net/http"
+	"regexp"
+	"strconv"
+	"sync"
+	"time"
 )
+
+// storeContainer is the minimal interface shared by sqlstore.Container and
+// mongostore.MongoContainer that GoWS needs.
+type storeContainer interface {
+	Close() error
+}
 
 // GoWS it's Go WebSocket or WhatSapp ;)
 type GoWS struct {
@@ -19,8 +34,13 @@ type GoWS struct {
 	events  chan interface{}
 
 	cancelContext context.CancelFunc
-	container     *sqlstore.Container
+	container     storeContainer
 }
+
+var (
+	clientVersionRegex = regexp.MustCompile(`"client_revision":(\d+),`)
+	waVersionOnce      sync.Once
+)
 
 func (gows *GoWS) handleEvent(event interface{}) {
 	var data interface{}
@@ -103,18 +123,45 @@ type ConnectedEventData struct {
 }
 
 func BuildSession(ctx context.Context, log waLog.Logger, dialect string, address string) (*GoWS, error) {
-	// Prepare the database
-	container, err := sqlstore.New(dialect, address, log.Sub("Database"))
-	if err != nil {
-		return nil, err
-	}
-	deviceStore, err := container.GetFirstDevice()
-	if err != nil {
-		_ = container.Close()
-		return nil, err
+	waVersionOnce.Do(func() {
+		if err := refreshLatestWAVersion(); err != nil {
+			log.Warnf("Failed to refresh WA web version, falling back to built-in value: %v", err)
+			return
+		}
+		log.Infof("WA web version refreshed to %v", store.GetWAVersion())
+	})
+
+	// Prepare the database — either MongoDB or a SQL backend (SQLite / PostgreSQL).
+	var container storeContainer
+	var deviceStore *store.Device
+
+	if dialect == "mongodb" {
+		mc, err := mongostore.New(address, log.Sub("Database"))
+		if err != nil {
+			return nil, err
+		}
+		ds, err := mc.GetFirstDevice()
+		if err != nil {
+			_ = mc.Close()
+			return nil, err
+		}
+		container = mc
+		deviceStore = ds
+	} else {
+		sc, err := sqlstore.New(context.Background(), dialect, address, log.Sub("Database"))
+		if err != nil {
+			return nil, err
+		}
+		ds, err := sc.GetFirstDevice(context.Background())
+		if err != nil {
+			_ = sc.Close()
+			return nil, err
+		}
+		container = sc
+		deviceStore = ds
 	}
 
-	// Configure the client
+	// Configure the WhatsApp client
 	client := whatsmeow.NewClient(deviceStore, log.Sub("Client"))
 	client.AutomaticMessageRerequestFromPhone = true
 	client.EmitAppStateEventsOnFullSync = true
@@ -128,6 +175,47 @@ func BuildSession(ctx context.Context, log waLog.Logger, dialect string, address
 		container,
 	}
 	return &gows, nil
+}
+
+func refreshLatestWAVersion() error {
+	req, err := http.NewRequest(http.MethodGet, "https://web.whatsapp.com", nil)
+	if err != nil {
+		return fmt.Errorf("prepare request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+
+	match := clientVersionRegex.FindSubmatch(data)
+	if len(match) == 0 {
+		return fmt.Errorf("client revision not found in response")
+	}
+	revision, err := strconv.ParseUint(string(match[1]), 10, 32)
+	if err != nil {
+		return fmt.Errorf("parse revision: %w", err)
+	}
+
+	store.SetWAVersion(store.WAVersionContainer{2, 3000, uint32(revision)})
+	return nil
 }
 
 func (gows *GoWS) GetEventChannel() <-chan interface{} {

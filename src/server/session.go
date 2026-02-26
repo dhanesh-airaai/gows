@@ -24,14 +24,16 @@ func (s *Server) StartSession(ctx context.Context, req *__.StartSessionRequest) 
 	dialect := req.Config.Store.Dialect
 	var address string
 	switch {
-	case dialect == "sqlite3":
-		address = req.Config.Store.Address + "?_foreign_keys=on"
-	case dialect == "sqlite":
+	case dialect == "sqlite3", dialect == "sqlite":
 		address = req.Config.Store.Address + "?_foreign_keys=on"
 	case dialect == "postgres":
 		address = addApplicationName(req.Config.Store.Address, "GOWS")
+	case dialect == "mongodb":
+		// MongoDB URL is passed through as-is; the database name must be
+		// embedded in the URL path: mongodb://user:pass@host:27017/<dbname>
+		address = req.Config.Store.Address
 	default:
-		return nil, errors.New("unsupported sql dialect: " + dialect)
+		return nil, errors.New("unsupported dialect: " + dialect)
 	}
 
 	cfg := gows.SessionConfig{
@@ -85,6 +87,7 @@ func (s *Server) RequestCode(ctx context.Context, req *__.PairCodeRequest) (*__.
 		return nil, err
 	}
 	code, err := cli.PairPhone(
+		ctx,
 		req.GetPhone(),
 		true,
 		whatsmeow.PairClientChrome,
@@ -101,7 +104,7 @@ func (s *Server) Logout(ctx context.Context, req *__.Session) (*__.Empty, error)
 	if err != nil {
 		return nil, err
 	}
-	err = cli.Logout()
+	err = cli.Logout(ctx)
 	if err != nil {
 		if errors.Is(err, whatsmeow.ErrNotLoggedIn) {
 			// Ignore not logged in error

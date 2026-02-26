@@ -27,8 +27,16 @@ func (s *Server) safeMarshal(v interface{}) (result string) {
 	return result
 }
 
-func (s *Server) StreamEvents(req *__.Session, stream grpc.ServerStreamingServer[__.EventJson]) error {
-	name := req.GetId()
+func (s *Server) StreamEvents(req *__.StreamEventsRequest, stream grpc.ServerStreamingServer[__.EventJson]) error {
+	session := req.GetSession()
+	if session == nil || session.GetId() == "" {
+		return fmt.Errorf("session id is required")
+	}
+	name := session.GetId()
+	excluded := make(map[string]struct{}, len(req.GetExclude()))
+	for _, eventName := range req.GetExclude() {
+		excluded[eventName] = struct{}{}
+	}
 	streamId := uuid.New()
 	listener := s.addListener(name, streamId)
 	defer s.removeListener(name, streamId)
@@ -40,6 +48,9 @@ func (s *Server) StreamEvents(req *__.Session, stream grpc.ServerStreamingServer
 			// Remove * at the start if it's *
 			eventType := reflect.TypeOf(event).String()
 			eventType = strings.TrimPrefix(eventType, "*")
+			if _, skip := excluded[eventType]; skip {
+				continue
+			}
 
 			jsonString := s.safeMarshal(event)
 			if jsonString == "" {
