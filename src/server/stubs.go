@@ -184,11 +184,116 @@ func (s *Server) UpdateContact(ctx context.Context, req *__.UpdateContactRequest
 }
 
 func (s *Server) GetContacts(ctx context.Context, req *__.GetContactsRequest) (*__.JsonList, error) {
-	return emptyJsonList(), nil
+	cli, err := s.Sm.Get(req.GetSession().GetId())
+	if err != nil {
+		return nil, err
+	}
+
+	contacts, err := cli.Store.Contacts.GetAllContacts(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	type contactItem struct {
+		Jid      string `json:"Jid"`
+		Name     string `json:"Name"`
+		PushName string `json:"PushName"`
+	}
+
+	items := make([]contactItem, 0, len(contacts))
+	for jid, info := range contacts {
+		normalized := jid.ToNonAD().String()
+		name := info.FullName
+		if name == "" {
+			name = info.BusinessName
+		}
+		items = append(items, contactItem{
+			Jid:      normalized,
+			Name:     name,
+			PushName: info.PushName,
+		})
+	}
+
+	// Sorting
+	sortField := "id"
+	sortDesc := false
+	if req.GetSortBy() != nil {
+		if req.GetSortBy().GetField() != "" {
+			sortField = strings.ToLower(req.GetSortBy().GetField())
+		}
+		sortDesc = req.GetSortBy().GetOrder() == __.SortBy_DESC
+	}
+	sort.Slice(items, func(i, j int) bool {
+		var less bool
+		switch sortField {
+		case "name":
+			if items[i].Name == items[j].Name {
+				less = items[i].Jid < items[j].Jid
+			} else {
+				less = items[i].Name < items[j].Name
+			}
+		default:
+			less = items[i].Jid < items[j].Jid
+		}
+		if sortDesc {
+			return !less
+		}
+		return less
+	})
+
+	// Pagination
+	offset := 0
+	limit := len(items)
+	if req.GetPagination() != nil {
+		if req.GetPagination().GetOffset() > 0 {
+			offset = int(req.GetPagination().GetOffset())
+		}
+		if req.GetPagination().GetLimit() > 0 {
+			limit = int(req.GetPagination().GetLimit())
+		}
+	}
+	if offset > len(items) {
+		offset = len(items)
+	}
+	end := offset + limit
+	if end > len(items) {
+		end = len(items)
+	}
+	items = items[offset:end]
+
+	elements := make([]*__.Json, 0, len(items))
+	for _, item := range items {
+		elements = append(elements, &__.Json{Data: jsonData(item)})
+	}
+	return &__.JsonList{Elements: elements}, nil
 }
 
 func (s *Server) GetContactById(ctx context.Context, req *__.EntityByIdRequest) (*__.Json, error) {
-	return &__.Json{Data: "{}"}, nil
+	cli, err := s.Sm.Get(req.GetSession().GetId())
+	if err != nil {
+		return nil, err
+	}
+
+	jid, err := types.ParseJID(req.GetId())
+	if err != nil {
+		return &__.Json{Data: "{}"}, nil
+	}
+
+	info, err := cli.Store.Contacts.GetContact(ctx, jid.ToNonAD())
+	if err != nil || !info.Found {
+		return &__.Json{Data: "{}"}, nil
+	}
+
+	name := info.FullName
+	if name == "" {
+		name = info.BusinessName
+	}
+	payload := map[string]interface{}{
+		"Jid":      jid.ToNonAD().String(),
+		"Name":     name,
+		"PushName": info.PushName,
+	}
+	return &__.Json{Data: jsonData(payload)}, nil
 }
 
 func (s *Server) CancelEventMessage(ctx context.Context, req *__.CancelEventMessageRequest) (*__.MessageResponse, error) {
